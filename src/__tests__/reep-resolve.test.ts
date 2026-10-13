@@ -18,8 +18,8 @@ beforeAll(async () => {
       ('rp0000000000000b', 'player', 'active', '100% Striker'),
       ('rpmergedsrc00001', 'player', 'redirected', 'Samuel Maslej'), ('rpsurvivor000001', 'player', 'active', 'Samuel Mašlej'),
       ('rpwithdrawn00000', 'player', 'withdrawn', 'Gone Player')`,
-    "CREATE TABLE bridges (provider VARCHAR, namespace VARCHAR, external_id VARCHAR, reep_id VARCHAR, rung VARCHAR)",
-    `INSERT INTO bridges VALUES
+    "CREATE TABLE bridges (provider VARCHAR, namespace VARCHAR, external_id VARCHAR, reep_id VARCHAR, rung VARCHAR, upstream_status VARCHAR)",
+    `INSERT INTO bridges (provider, namespace, external_id, reep_id, rung) VALUES
       ('wyscout', 'player', '379209', 'rp1b829f1d3468c4', NULL),
       ('skillcorner', 'player', '12174', 'rp1b829f1d3468c4', NULL),
       ('transfermarkt', 'spieler', '11', 'rp1b829f1d3468c4', NULL),
@@ -28,13 +28,19 @@ beforeAll(async () => {
       ('wyscout', 'player', '555', 'rpsurvivor000001', NULL),
       ('wyscout', 'player', '555', 'rpmergedsrc00001', NULL),
       ('opta', 'player', '777', 'rpwithdrawn00000', NULL)`,
+    `INSERT INTO bridges VALUES
+      ('transfermarkt', 'spieler', '999', 'rp1b829f1d3468c4', NULL, 'retired'),
+      ('skillcorner', 'player', '55555', 'rp1b829f1d3468c4', NULL, 'removed')`,
     "CREATE TABLE redirects (from_id VARCHAR, to_id VARCHAR, reason VARCHAR)",
     `INSERT INTO redirects VALUES
       ('rpdeadbeef000000', 'rp1b829f1d3468c4', 'merged'),
       ('rpwithdrawn00000', '', 'de_corroborated'),
       ('rpwithheld000000', NULL, 'withheld'),
       ('rpmergedgone0000', 'rpwithdrawn00000', 'merged'),
-      ('rpmergedsrc00001', 'rpsurvivor000001', 'merged')`,
+      ('rpmergedsrc00001', 'rpsurvivor000001', 'merged'),
+      ('rploopa000000001', 'rploopb000000001', 'merged'),
+      ('rploopb000000001', 'rploopa000000001', 'merged'),
+      ('rpdangling000001', 'rpnowhere0000001', 'merged')`,
     "CREATE TABLE entity_search (reep_id VARCHAR, entity_type VARCHAR, label VARCHAR, search_text VARCHAR, bridge_count BIGINT)",
     "INSERT INTO entity_search VALUES ('rp1b829f1d3468c4', 'player', 'Declan Rice', 'declan rice rice', 3), ('rt0000000000000a', 'team', 'Some Club', 'some club', 1), ('rp0000000000000b', 'player', '100% Striker', '100% striker', 0)",
   ]) {
@@ -151,6 +157,52 @@ describe("resolve_entity against a local register", () => {
     expect(t).not.toContain("Samuel Maslej (player)");
   });
 
+  it("marks provider IDs the provider no longer uses, and lists live ones first", async () => {
+    const r = await resolveEntity(
+      { provider: "wyscout", namespace: "player", id: "379209" },
+      { env: LOCAL, openLocal, fetchImpl: latest(STAMP) },
+    );
+    const t = text(r);
+    expect(t).toContain("transfermarkt / spieler: 999 (retired by the provider)");
+    expect(t).toContain("skillcorner / player: 55555 (removed from the provider's list)");
+    expect(t).toContain("map to the unmarked ones");
+    expect(t.indexOf("skillcorner / player: 12174")).toBeLessThan(t.indexOf("transfermarkt / spieler: 999"));
+    expect(t.indexOf("wyscout / player: 379209")).toBeLessThan(t.indexOf("skillcorner / player: 55555"));
+  });
+
+  it("still resolves a retired provider ID, and says it is retired", async () => {
+    const r = await resolveEntity(
+      { provider: "transfermarkt", namespace: "spieler", id: "999" },
+      { env: LOCAL, openLocal, fetchImpl: latest(STAMP) },
+    );
+    expect(text(r)).toContain("### Declan Rice (player)");
+    expect(text(r)).toContain("Matched: transfermarkt / spieler: 999 (retired by the provider)");
+  });
+
+  it("reads a register file from before upstream_status existed", async () => {
+    const instance = await DuckDBInstance.create(":memory:");
+    const con = await instance.connect();
+    for (const sql of [
+      "CREATE TABLE entities (reep_id VARCHAR, entity_type VARCHAR, status VARCHAR, label VARCHAR)",
+      "INSERT INTO entities VALUES ('rp1b829f1d3468c4', 'player', 'active', 'Declan Rice')",
+      "CREATE TABLE bridges (provider VARCHAR, namespace VARCHAR, external_id VARCHAR, reep_id VARCHAR, rung VARCHAR)",
+      "INSERT INTO bridges VALUES ('wyscout', 'player', '379209', 'rp1b829f1d3468c4', NULL), ('skillcorner', 'player', '12174', 'rp1b829f1d3468c4', NULL)",
+      "CREATE TABLE redirects (from_id VARCHAR, to_id VARCHAR, reason VARCHAR)",
+    ]) {
+      await con.run(sql);
+    }
+    const old: LocalRegister = {
+      stamp: STAMP,
+      query: async (sql, params) => (await con.runAndReadAll(sql, params)).getRowObjectsJson() as Record<string, unknown>[],
+    };
+    const r = await resolveEntity(
+      { provider: "wyscout", namespace: "player", id: "379209" },
+      { env: LOCAL, openLocal: async () => old, fetchImpl: latest(STAMP) },
+    );
+    expect(text(r)).toContain("skillcorner / player: 12174");
+    expect(text(r)).not.toContain("retired");
+  });
+
   it("lists a provider ID still attached to a merged ID under the survivor, once", async () => {
     const r = await resolveEntity({ reep_id: "rpsurvivor000001" }, { env: LOCAL, openLocal, fetchImpl: latest(STAMP) });
     const t = text(r);
@@ -178,6 +230,17 @@ describe("resolve_entity against a local register", () => {
     expect(new Set(rows.map((row) => row.reep_id))).toEqual(new Set(["rpsurvivor000001"]));
     expect(rows[0].bridged_id).toBe("rpmergedsrc00001");
     expect(rows.some((row) => row.provider === "transfermarkt" && row.external_id === "1146905")).toBe(true);
+  });
+
+  it("reports a redirect loop as withdrawn, as the reep package does", async () => {
+    const r = await resolveEntity({ reep_id: "rploopa000000001" }, { env: LOCAL, openLocal, fetchImpl: latest(STAMP) });
+    expect(text(r)).toContain("Reep ID rploopa000000001 is withdrawn (reason: redirect_loop)");
+  });
+
+  it("reports a redirect to an ID with no entity as withdrawn, not as unknown", async () => {
+    const r = await resolveEntity({ reep_id: "rpdangling000001" }, { env: LOCAL, openLocal, fetchImpl: latest(STAMP) });
+    expect(text(r)).toContain("Reep ID rpdangling000001 is withdrawn: it redirects to rpnowhere0000001, which has no entity in this release.");
+    expect(text(r)).not.toContain("No Reep entity matches");
   });
 
   it("reports a withdrawn ID as withdrawn, not as unknown", async () => {
@@ -209,7 +272,9 @@ describe("resolve_entity against a local register", () => {
     expect(await register.query(statements[1], {})).toEqual([]);
     const merged = text(await resolveEntity({ reep_id: "rpdeadbeef000000" }, { env: {}, fetchImpl: noNetwork }));
     const survivorSql = merged.split("```sql\n")[1].split("\n```")[0].split(";")[1];
-    expect((await register.query(survivorSql, {})).length).toBe(3);
+    const survivorRows = await register.query(survivorSql, {});
+    expect(survivorRows.length).toBe(5);
+    expect(survivorRows.map((row) => row.upstream_status)).toEqual(["", "", "", "removed", "retired"]);
   });
 
   it("treats % in a name as a literal character", async () => {

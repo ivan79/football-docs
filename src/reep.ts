@@ -63,7 +63,34 @@ type Bridge = {
   role?: string;
   /** The merged Reep ID this bridge is still attached to in the release, when it is not the entity's own. */
   via?: string;
+  /** Empty for a provider ID still in use; "retired" or "removed" when the provider no longer uses it. */
+  upstream_status?: string;
 };
+
+/** How a non-live provider ID is marked, from bridges.upstream_status. */
+function upstreamLabel(status: string | undefined): string {
+  if (!status) return "";
+  if (status === "retired") return "retired by the provider";
+  if (status === "removed") return "removed from the provider's list";
+  return `upstream status: ${status}`;
+}
+
+// bridges.upstream_status arrived in the 2026-09-26 release; older files lack it.
+const upstreamColumn = new WeakMap<LocalRegister, Promise<boolean>>();
+function hasUpstreamStatus(register: LocalRegister): Promise<boolean> {
+  let known = upstreamColumn.get(register);
+  if (!known) {
+    known = register
+      .query(
+        "SELECT count(*) AS n FROM information_schema.columns WHERE table_name = 'bridges' AND column_name = 'upstream_status'",
+        {},
+      )
+      .then((rows) => Number(rows[0]?.n ?? 0) > 0)
+      .catch(() => false);
+    upstreamColumn.set(register, known);
+  }
+  return known;
+}
 type Found = {
   reep_id: string;
   label: string;
@@ -138,7 +165,7 @@ async function localRegister(path: string, options: ResolveEntityOptions): Promi
  * table holds these as rows with an empty to_id, next to the merges (which carry
  * the survivor): reason de_corroborated (withdrawn) or withheld.
  */
-type Tombstone = { id: string; reason: string; requested_id?: string; matched?: string };
+type Tombstone = { id: string; reason: string; requested_id?: string; matched?: string; /** Where a dangling redirect points. */ target?: string };
 
 /**
  * Follow merge redirects to the survivor (bounded, in case of a chain). A row
@@ -147,17 +174,23 @@ type Tombstone = { id: string; reason: string; requested_id?: string; matched?: 
  */
 async function followRedirects(register: LocalRegister, start: string): Promise<{ id: string; tombstone?: Tombstone }> {
   let current = start;
+  const seen = new Set([start]);
   for (let hop = 0; hop < 5; hop++) {
     const next = await register.query("SELECT to_id, reason FROM redirects WHERE from_id = $id", { id: current });
-    if (!next.length) break;
+    if (!next.length) return { id: current };
     const to = next[0].to_id == null ? "" : String(next[0].to_id).trim();
     if (!to) {
       const reason = next[0].reason == null ? "" : String(next[0].reason).trim();
       return { id: current, tombstone: { id: current, reason, requested_id: current === start ? undefined : start } };
     }
+    // A loop has no survivor: report it as withdrawn, as the reep package does.
+    if (seen.has(to)) return { id: current, tombstone: { id: start, reason: "redirect_loop" } };
+    seen.add(to);
     current = to;
   }
-  return { id: current };
+  // Still redirecting after 5 steps (the published ledger is flat, so this
+  // should not happen): no survivor was reached.
+  return { id: current, tombstone: { id: start, reason: "redirect_loop" } };
 }
 
 async function localLookup(
@@ -172,11 +205,14 @@ async function localLookup(
     matched_namespace?: string;
   }> = [];
 
+  const upstream = await hasUpstreamStatus(register);
+  const upstreamCol = upstream ? "upstream_status" : "NULL AS upstream_status";
+
   if (q.kind === "provider") {
     const params: Record<string, string> = { provider: q.provider, id: q.id };
     let sql =
-      "SELECT DISTINCT b.reep_id, b.namespace FROM bridges b JOIN entities e USING (reep_id) " +
-      "WHERE b.provider = $provider AND b.external_id = $id";
+      `SELECT DISTINCT b.reep_id, b.namespace, ${upstream ? "b.upstream_status" : "NULL AS upstream_status"} ` +
+      "FROM bridges b JOIN entities e USING (reep_id) WHERE b.provider = $provider AND b.external_id = $id";
     if (q.namespace) {
       sql += " AND b.namespace = $namespace";
       params.namespace = q.namespace;
@@ -185,11 +221,15 @@ async function localLookup(
       sql += " AND e.entity_type = $type";
       params.type = q.type;
     }
-    ids = (await register.query(`${sql} LIMIT ${MAX_RESULTS}`, params)).map((r) => ({
-      reep_id: String(r.reep_id),
-      matched: `${q.provider} / ${String(r.namespace ?? "")}: ${q.id}`,
-      matched_namespace: String(r.namespace ?? ""),
-    }));
+    ids = (await register.query(`${sql} LIMIT ${MAX_RESULTS}`, params)).map((r) => {
+      // A retired ID still resolves, so stored old IDs keep working; say so.
+      const status = upstreamLabel(r.upstream_status == null ? "" : String(r.upstream_status).trim());
+      return {
+        reep_id: String(r.reep_id),
+        matched: `${q.provider} / ${String(r.namespace ?? "")}: ${q.id}${status ? ` (${status})` : ""}`,
+        matched_namespace: String(r.namespace ?? ""),
+      };
+    });
   } else if (q.kind === "reep_id") {
     ids = [{ reep_id: q.reepId }];
   } else {
@@ -221,7 +261,14 @@ async function localLookup(
     const entity = await register.query("SELECT reep_id, label, entity_type FROM entities WHERE reep_id = $id", {
       id: target.id,
     });
-    if (!entity.length) continue;
+    if (!entity.length) {
+      // A redirect that ends at an ID with no entity in this release has no
+      // survivor: report it rather than dropping the hit.
+      if (target.id !== hit.reep_id) {
+        tombstones.push({ id: hit.reep_id, reason: "target_not_in_release", target: target.id, matched: hit.matched });
+      }
+      continue;
+    }
     // A release can leave a provider ID on a merged Reep ID, not on its survivor,
     // so the survivor's own bridges are incomplete. Add the bridges of every ID
     // merged into it (through chains, bounded), marked with the merged ID.
@@ -232,7 +279,7 @@ async function localLookup(
         "  UNION ALL",
         "  SELECT r.from_id, m.depth + 1 FROM redirects r JOIN merged m ON r.to_id = m.id WHERE m.depth < 5",
         ")",
-        "SELECT provider, namespace, external_id, CASE WHEN reep_id = $id THEN NULL ELSE reep_id END AS via",
+        `SELECT provider, namespace, external_id, ${upstreamCol}, CASE WHEN reep_id = $id THEN NULL ELSE reep_id END AS via`,
         "FROM bridges WHERE reep_id = $id OR reep_id IN (SELECT id FROM merged)",
         "ORDER BY provider, namespace, external_id, via NULLS FIRST",
       ].join("\n"),
@@ -252,6 +299,7 @@ async function localLookup(
           namespace: String(b.namespace ?? ""),
           external_id: String(b.external_id),
           via: b.via == null ? undefined : String(b.via),
+          upstream_status: b.upstream_status == null ? undefined : String(b.upstream_status).trim() || undefined,
         }))
         .filter((b) => {
           // The survivor's own bridge wins over the same provider ID on a merged ID.
@@ -259,7 +307,9 @@ async function localLookup(
           if (own.has(key)) return false;
           own.add(key);
           return true;
-        }),
+        })
+        // Live provider IDs first: those are the ones to map to.
+        .sort((x, y) => Number(Boolean(x.upstream_status)) - Number(Boolean(y.upstream_status))),
     });
   }
   if (q.kind === "reep_id" && tombstones.length) return { found: [], tombstone: tombstones[0], tombstones };
@@ -277,9 +327,13 @@ function tombstoneText(t: Tombstone): string {
       : t.reason === "withheld"
         ? "is withheld (reason: withheld). It is a live, corroborated ID that a publication rule (for example named " +
           "teams or the season horizon) keeps out of this release."
-        : `has a tombstone in the redirects table (reason: ${t.reason || "none given"}) with no survivor.`;
+        : t.reason === "redirect_loop"
+          ? "is withdrawn (reason: redirect_loop). Its redirects form a loop, or never reach a survivor."
+          : t.reason === "target_not_in_release"
+            ? `is withdrawn: it redirects to ${t.target ?? "an ID"}, which has no entity in this release.`
+            : `has a tombstone in the redirects table (reason: ${t.reason || "none given"}) with no survivor.`;
   return (
-    `${matched}${via}Reep ID ${t.id} ${what} It is not a merge, so there is no survivor ID. Do not treat it as an unknown ID: ` +
+    `${matched}${via}Reep ID ${t.id} ${what} There is no survivor ID. Do not treat it as an unknown ID: ` +
     "it was published, and the ID will never be reused."
   );
 }
@@ -474,8 +528,9 @@ function sqlFor(q: Query): string {
     return [
       "-- A bridge can name a merged Reep ID: follow its redirect to the survivor. An empty",
       "-- to_id is a tombstone (redirect_reason de_corroborated or withheld), not a merge.",
+      "-- upstream_status: empty for a live ID, retired or removed when the provider no longer uses it.",
       "SELECT b.reep_id AS bridged_id, r.reason AS redirect_reason, e.reep_id, e.label, e.entity_type,",
-      "       o.provider, o.namespace, o.external_id",
+      "       o.provider, o.namespace, o.external_id, coalesce(o.upstream_status, '') AS upstream_status",
       "FROM bridges b",
       "LEFT JOIN redirects r ON r.from_id = b.reep_id",
       "JOIN entities e ON e.reep_id = coalesce(nullif(r.to_id, ''), b.reep_id)",
@@ -483,7 +538,7 @@ function sqlFor(q: Query): string {
       "JOIN bridges o ON o.reep_id = e.reep_id OR o.reep_id IN (SELECT from_id FROM redirects WHERE to_id = e.reep_id)",
       `WHERE b.provider = ${quote(q.provider)}${q.namespace ? ` AND b.namespace = ${quote(q.namespace)}` : ""}`,
       `  AND b.external_id = ${quote(q.id)}`,
-      "ORDER BY o.provider, o.namespace;",
+      "ORDER BY coalesce(o.upstream_status, '') <> '', o.provider, o.namespace;",
     ].join("\n");
   }
   if (q.kind === "reep_id") {
@@ -494,12 +549,13 @@ function sqlFor(q: Query): string {
       "",
       "-- Then follow a merge redirect to the survivor, and list every provider ID, including",
       "-- any still attached to an ID merged into it (bridged_on names that ID).",
-      "SELECT e.reep_id, e.label, e.entity_type, b.provider, b.namespace, b.external_id, b.reep_id AS bridged_on",
+      "SELECT e.reep_id, e.label, e.entity_type, b.provider, b.namespace, b.external_id, b.reep_id AS bridged_on,",
+      "       coalesce(b.upstream_status, '') AS upstream_status",
       "FROM entities e",
       "JOIN bridges b ON b.reep_id = e.reep_id OR b.reep_id IN (SELECT from_id FROM redirects WHERE to_id = e.reep_id)",
       `WHERE e.reep_id = coalesce((SELECT nullif(to_id, '') FROM redirects WHERE from_id = ${quote(q.reepId)}), ${quote(q.reepId)})`,
       `  AND NOT EXISTS (SELECT 1 FROM redirects WHERE from_id = ${quote(q.reepId)} AND coalesce(to_id, '') = '')`,
-      "ORDER BY b.provider, b.namespace;",
+      "ORDER BY coalesce(b.upstream_status, '') <> '', b.provider, b.namespace;",
     ].join("\n");
   }
   return [
@@ -546,7 +602,16 @@ function formatFound(found: Found[]): string {
         for (const b of f.bridges) {
           const role = b.role && b.role !== "canonical_bridge" ? ` (${b.role})` : "";
           const via = b.via ? ` (via merged ${b.via})` : "";
-          lines.push(`  ${b.provider}${b.namespace ? ` / ${b.namespace}` : ""}: ${b.external_id}${role}${via}`);
+          const status = upstreamLabel(b.upstream_status);
+          lines.push(
+            `  ${b.provider}${b.namespace ? ` / ${b.namespace}` : ""}: ${b.external_id}${role}${via}${status ? ` (${status})` : ""}`,
+          );
+        }
+        if (f.bridges.some((b) => b.upstream_status)) {
+          lines.push(
+            "  Provider IDs marked retired or removed are no longer in use at that provider. They still resolve, " +
+              "but map to the unmarked ones.",
+          );
         }
       } else if (f.bridge_count !== undefined) {
         lines.push(`Providers bridged: ${f.bridge_count}`);
