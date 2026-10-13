@@ -2,7 +2,7 @@
 source_url: https://reep.football/data/
 source_type: curated
 upstream_version: null
-crawled_at: 2026-09-29
+crawled_at: 2026-10-13
 ---
 
 # Reep download: DuckDB and CSV
@@ -55,7 +55,7 @@ before any bulk matching job.
 | `bridges` | `provider, namespace, external_id, reep_id, rung, upstream_status` | The crosswalk: one row per provider ID. `rung` says how the bridge was corroborated; `upstream_status` says whether the provider still uses the ID. |
 | `entities` | `reep_id, entity_type, status, label, gender, country, …` | One row per identity. |
 | `aliases` | `reep_id, alias, kind, rank, language` | Alternate and historical names. |
-| `redirects` | `from_id, to_id, reason` | IDs retired by a merge, pointing at the survivor. |
+| `redirects` | `from_id, to_id, reason` | IDs retired by a merge, pointing at the survivor (`reason = merged`), plus a few tombstones with an empty `to_id`. The ledger is flat: a `to_id` is never itself a `from_id`. |
 
 The DuckDB file is self-describing: `SHOW TABLES;` and `DESCRIBE bridges;`.
 Source: [get-started guide](https://reep.football/get-started).
@@ -79,24 +79,60 @@ the live one. The examples below do this with
 `coalesce(b.upstream_status, '') = ''`, which works whether the empty value
 arrives as NULL or as an empty string.
 
+### Bridges can name a merged Reep ID
+
+When two Reep IDs merge, the losing ID keeps its bridge rows, and `redirects`
+points it at the survivor. So a bridge's `reep_id` can be a merged ID. In release
+`20261005T180536Z`, 4,211 bridges name a merged ID. For example,
+`transfermarkt / spieler / 1146905` is bridged on `rp799a2e2f9861aa` (status
+`redirected`, "Samuel Maslej"), which redirects to `rp277340b925e0d2`
+("Samuel Mašlej"). The survivor's own bridges have no Transfermarkt row.
+
+A join from `bridges` straight to `entities` and back to `bridges` therefore
+lands on the merged entity and misses the survivor's other provider IDs. In that
+release, mapping this Transfermarkt ID to Wyscout that way returns no Wyscout ID.
+Resolve every bridge to its survivor first, and join on the survivor. One join is
+enough, because the ledger is flat:
+
+```sql
+WITH rb AS (   -- every bridge, with the Reep ID it resolves to
+  SELECT b.*, coalesce(nullif(r.to_id, ''), b.reep_id) AS survivor_id
+  FROM bridges b
+  LEFT JOIN redirects r ON r.from_id = b.reep_id
+)
+SELECT * FROM rb LIMIT 5;
+```
+
+An entity's full set of provider IDs is every `rb` row whose `survivor_id` is
+its Reep ID. A tombstone (empty `to_id`) leaves the bridge on its own ID. The
+examples below use `rb`. Checked on release `20261005T180536Z`.
+
 ## Map one provider's ID to another's
 
 Two hops through the Reep ID. Swap the two provider clauses to go the other way.
 
 ```sql
 -- Wyscout player ID → Reep ID → SkillCorner player ID
+WITH rb AS (
+  SELECT b.*, coalesce(nullif(r.to_id, ''), b.reep_id) AS survivor_id
+  FROM bridges b
+  LEFT JOIN redirects r ON r.from_id = b.reep_id
+)
 SELECT a.external_id AS wyscout_id, e.reep_id, e.label,
        b.external_id AS skillcorner_id
-FROM bridges a
-JOIN entities e USING (reep_id)
-LEFT JOIN bridges b
-       ON b.reep_id = e.reep_id
+FROM rb a
+JOIN entities e ON e.reep_id = a.survivor_id
+LEFT JOIN rb b
+       ON b.survivor_id = e.reep_id
       AND b.provider = 'skillcorner' AND b.namespace = 'player'
       AND coalesce(b.upstream_status, '') = ''
 WHERE a.provider = 'wyscout' AND a.namespace = 'player'
   AND a.external_id = '379209';
 -- → rp1b829f1d3468c4 · Declan Rice · skillcorner 12174
 ```
+
+The same query for `transfermarkt / spieler / 1146905` to Wyscout returns
+`rp277340b925e0d2` · Samuel Mašlej · wyscout 908077.
 
 ## Bridge a whole file in one pass
 
@@ -105,16 +141,21 @@ DuckDB reads CSV directly, so your own file joins without an import step.
 ```sql
 CREATE TABLE my_squad AS SELECT * FROM read_csv_auto('my_squad.csv');
 
+WITH rb AS (
+  SELECT b.*, coalesce(nullif(r.to_id, ''), b.reep_id) AS survivor_id
+  FROM bridges b
+  LEFT JOIN redirects r ON r.from_id = b.reep_id
+)
 SELECT m.*, e.reep_id, e.label AS reep_label,
        string_agg(DISTINCT b.external_id, '|') FILTER (WHERE b.provider = 'skillcorner') AS skillcorner_id,
        string_agg(DISTINCT b.external_id, '|') FILTER (WHERE b.provider = 'opta')        AS opta_id
 FROM my_squad m
-LEFT JOIN bridges a
+LEFT JOIN rb a
        ON a.provider = 'wyscout' AND a.namespace = 'player'
       AND a.external_id = CAST(m.wyscout_id AS VARCHAR)
-LEFT JOIN entities e USING (reep_id)
-LEFT JOIN bridges b
-       ON b.reep_id = e.reep_id
+LEFT JOIN entities e ON e.reep_id = a.survivor_id
+LEFT JOIN rb b
+       ON b.survivor_id = e.reep_id
       AND (b.provider, b.namespace) IN (('skillcorner', 'player'), ('opta', 'person'))
       AND coalesce(b.upstream_status, '') = ''
 GROUP BY ALL;
@@ -131,8 +172,10 @@ per entity with a column per provider:
 ```sql
 COPY (
   PIVOT (
-    SELECT b.reep_id, e.label, b.provider || '_' || b.namespace AS id_column, b.external_id
-    FROM bridges b JOIN entities e USING (reep_id)
+    SELECT e.reep_id, e.label, b.provider || '_' || b.namespace AS id_column, b.external_id
+    FROM bridges b
+    LEFT JOIN redirects r ON r.from_id = b.reep_id
+    JOIN entities e ON e.reep_id = coalesce(nullif(r.to_id, ''), b.reep_id)
     WHERE e.entity_type = 'team'
       AND coalesce(b.upstream_status, '') = ''
   )
