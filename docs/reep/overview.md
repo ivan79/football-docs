@@ -53,7 +53,19 @@ source that is set up in the MCP server's environment:
    getintouch+nutmeg@withqwerty.com). There is no self-service sign-up.
 
 With neither set, the tool explains both options and returns the DuckDB query
-that answers the question from the download. Example MCP configuration:
+that answers the question from the download.
+
+What the answers say:
+
+- A merged Reep ID is followed to its survivor, and the answer names both IDs.
+- A withdrawn or withheld Reep ID (a tombstone in `redirects`, with an empty
+  `to_id`) is reported as withdrawn or withheld, with the reason. It is not
+  reported as unknown: it was published, and the ID is never reused.
+- A provider ID looked up without a namespace gets a note: which namespace it
+  matched in, or a warning when it matched in more than one. Pass the
+  namespace (or the entity type) to be sure of the entity.
+
+Example MCP configuration:
 
 ```json
 {

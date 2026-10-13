@@ -63,6 +63,8 @@ type Found = {
   entity_type: string;
   requested_id?: string;
   matched?: string;
+  /** The namespace a provider-ID lookup matched in. */
+  matched_namespace?: string;
   bridges?: Bridge[];
   bridge_count?: number;
 };
@@ -124,8 +126,21 @@ async function localRegister(path: string, options: ResolveEntityOptions): Promi
   return opened.register;
 }
 
-async function localLookup(register: LocalRegister, q: Query): Promise<Found[]> {
-  let ids: Array<{ reep_id: string; requested_id?: string; bridge_count?: number; matched?: string }> = [];
+/**
+ * A Reep ID that was published and is no longer in the register. The redirects
+ * table holds these as rows with an empty to_id, next to the merges (which carry
+ * the survivor): reason de_corroborated (withdrawn) or withheld.
+ */
+type Tombstone = { id: string; reason: string; requested_id?: string };
+
+async function localLookup(register: LocalRegister, q: Query): Promise<{ found: Found[]; tombstone?: Tombstone }> {
+  let ids: Array<{
+    reep_id: string;
+    requested_id?: string;
+    bridge_count?: number;
+    matched?: string;
+    matched_namespace?: string;
+  }> = [];
 
   if (q.kind === "provider") {
     const params: Record<string, string> = { provider: q.provider, id: q.id };
@@ -143,14 +158,21 @@ async function localLookup(register: LocalRegister, q: Query): Promise<Found[]> 
     ids = (await register.query(`${sql} LIMIT ${MAX_RESULTS}`, params)).map((r) => ({
       reep_id: String(r.reep_id),
       matched: `${q.provider} / ${String(r.namespace ?? "")}: ${q.id}`,
+      matched_namespace: String(r.namespace ?? ""),
     }));
   } else if (q.kind === "reep_id") {
-    // Follow merge redirects to the survivor (bounded, in case of a chain).
+    // Follow merge redirects to the survivor (bounded, in case of a chain). A row
+    // with an empty to_id is a tombstone, not a merge: stop and report it.
     let current = q.reepId;
     for (let hop = 0; hop < 5; hop++) {
-      const next = await register.query("SELECT to_id FROM redirects WHERE from_id = $id", { id: current });
+      const next = await register.query("SELECT to_id, reason FROM redirects WHERE from_id = $id", { id: current });
       if (!next.length) break;
-      current = String(next[0].to_id);
+      const to = next[0].to_id == null ? "" : String(next[0].to_id).trim();
+      if (!to) {
+        const reason = next[0].reason == null ? "" : String(next[0].reason).trim();
+        return { found: [], tombstone: { id: current, reason, requested_id: current === q.reepId ? undefined : q.reepId } };
+      }
+      current = to;
     }
     ids = [{ reep_id: current, requested_id: current === q.reepId ? undefined : q.reepId }];
   } else {
@@ -183,6 +205,7 @@ async function localLookup(register: LocalRegister, q: Query): Promise<Found[]> 
       entity_type: String(entity[0].entity_type),
       requested_id: hit.requested_id,
       matched: hit.matched,
+      matched_namespace: hit.matched_namespace,
       bridges: bridges.map((b) => ({
         provider: String(b.provider),
         namespace: String(b.namespace ?? ""),
@@ -190,7 +213,47 @@ async function localLookup(register: LocalRegister, q: Query): Promise<Found[]> 
       })),
     });
   }
-  return found;
+  return { found };
+}
+
+/** What a tombstone means, from the redirects table's published schema note. */
+function tombstoneText(t: Tombstone): string {
+  const via = t.requested_id ? `${t.requested_id} was merged into ${t.id}, and ` : "";
+  const what =
+    t.reason === "de_corroborated"
+      ? "is withdrawn (reason: de_corroborated). It was in an earlier release, and this release no longer admits it " +
+        "because its corroboration fell below the register's threshold."
+      : t.reason === "withheld"
+        ? "is withheld (reason: withheld). It is a live, corroborated ID that a publication rule (for example named " +
+          "teams or the season horizon) keeps out of this release."
+        : `has a tombstone in the redirects table (reason: ${t.reason || "none given"}) with no survivor.`;
+  return (
+    `${via}Reep ID ${t.id} ${what} It is not a merge, so there is no survivor ID, and the release lists no provider ` +
+    "IDs for it. Do not treat it as an unknown ID: it was published, and the ID will never be reused."
+  );
+}
+
+/**
+ * A provider-ID lookup without a namespace. Reep keys bridges on (provider,
+ * namespace, external_id), and providers reuse numbers across entity types, so
+ * a single match can still be the wrong kind of entity.
+ */
+function namespaceNote(q: Query, found: Found[]): string {
+  if (q.kind !== "provider" || q.namespace || !found.length) return "";
+  const namespaces = [...new Set(found.map((f) => f.matched_namespace).filter((n): n is string => Boolean(n)))];
+  if (namespaces.length > 1) {
+    return (
+      `\n\n**No namespace was given, and this ID matches in ${namespaces.length} namespaces.** ${q.provider} reuses ` +
+      "numbers across entity types. Pass namespace to pick the one you mean."
+    );
+  }
+  if (q.type) return "";
+  const where = namespaces.length ? ` It matched only in namespace "${namespaces[0]}".` : "";
+  return (
+    `\n\n**No namespace was given.**${where} Reep keys provider IDs on provider, namespace and ID, and ` +
+    `${q.provider} may use the same number for different kinds of entity. Pass namespace (or type) to be sure this ` +
+    "is the entity you meant."
+  );
 }
 
 // Keyed by the fetch implementation, so an injected fetch never sees another's cache.
@@ -313,7 +376,13 @@ async function apiLookup(q: Query, key: string, base: string, fetchImpl: typeof 
       true,
     );
   }
-  if (response.status === 404) return textResult(`No Reep entity matches that query.${footer ? `\n\n${footer}` : ""}`);
+  if (response.status === 404) {
+    // Keep the API's own error code and message: a removed entity leaves a
+    // tombstone, and "not found" alone would hide that it was ever published.
+    const error = (await response.json().catch(() => null)) as { error?: string; message?: string; detail?: string } | null;
+    const why = [error?.error, error?.message, error?.detail].filter(Boolean).join(": ");
+    return textResult(`No Reep entity matches that query${why ? ` (${why})` : ""}.${footer ? `\n\n${footer}` : ""}`);
+  }
 
   let body: { results?: ApiEntity[] } & ApiEntity;
   try {
@@ -333,9 +402,16 @@ async function apiLookup(q: Query, key: string, base: string, fetchImpl: typeof 
 
   const found = (q.kind === "reep_id" ? [body] : (body.results ?? [])).map(fromApi);
   if (!found.length) return textResult(`No Reep entity matches that query.${footer ? `\n\n${footer}` : ""}`);
+  if (q.kind === "provider") {
+    for (const f of found) {
+      f.matched_namespace = f.bridges?.find((b) => b.provider === q.provider && b.external_id === q.id)?.namespace;
+    }
+  }
   const hint =
     q.kind === "name" ? "\n\nSearch results carry no provider IDs. Call again with reep_id to get every provider ID." : "";
-  return textResult(`Found ${found.length} result(s) via the Reep API:\n\n${formatFound(found)}${hint}${footer ? `\n\n${footer}` : ""}`);
+  return textResult(
+    `Found ${found.length} result(s) via the Reep API:\n\n${formatFound(found)}${hint}${namespaceNote(q, found)}${footer ? `\n\n${footer}` : ""}`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -356,10 +432,14 @@ function sqlFor(q: Query): string {
   }
   if (q.kind === "reep_id") {
     return [
-      "-- Follow a merge redirect first, then list every provider ID.",
+      "-- First check for a tombstone: a redirect with an empty to_id means the ID was withdrawn",
+      "-- (reason de_corroborated) or withheld, not merged.",
+      `SELECT from_id, to_id, reason FROM redirects WHERE from_id = ${quote(q.reepId)};`,
+      "",
+      "-- Then follow a merge redirect to the survivor, and list every provider ID.",
       "SELECT e.reep_id, e.label, e.entity_type, b.provider, b.namespace, b.external_id",
       "FROM entities e JOIN bridges b USING (reep_id)",
-      `WHERE e.reep_id = coalesce((SELECT to_id FROM redirects WHERE from_id = ${quote(q.reepId)}), ${quote(q.reepId)})`,
+      `WHERE e.reep_id = coalesce((SELECT nullif(to_id, '') FROM redirects WHERE from_id = ${quote(q.reepId)}), ${quote(q.reepId)})`,
       "ORDER BY b.provider, b.namespace;",
     ].join("\n");
   }
@@ -429,17 +509,12 @@ export async function resolveEntity(args: ResolveEntityArgs, options: ResolveEnt
   if (path) {
     try {
       const register = await localRegister(path, options);
-      const found = await localLookup(register, q);
+      const { found, tombstone } = await localLookup(register, q);
       const note = await freshnessNote(path, register.stamp, fetchImpl);
+      if (tombstone) return textResult(`${tombstoneText(tombstone)}\n\n${note}`);
       if (!found.length) return textResult(`No Reep entity matches that query in the local register.\n\n${note}`);
-      const namespaces = new Set(found.map((f) => f.matched?.split(":")[0]));
-      const warning =
-        q.kind === "provider" && !q.namespace && namespaces.size > 1
-          ? `\n\n**No namespace was given, and this ID matches in ${namespaces.size} namespaces.** ${q.provider} reuses ` +
-            "numbers across entity types. Pass namespace to pick the one you mean."
-          : "";
       return textResult(
-        `Found ${found.length} result(s) in the local Reep register:\n\n${formatFound(found)}${warning}\n\n${note}`,
+        `Found ${found.length} result(s) in the local Reep register:\n\n${formatFound(found)}${namespaceNote(q, found)}\n\n${note}`,
       );
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);

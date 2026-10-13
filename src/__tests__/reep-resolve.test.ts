@@ -22,7 +22,11 @@ beforeAll(async () => {
       ('transfermarkt', 'spieler', '11', 'rp1b829f1d3468c4', NULL),
       ('transfermarkt', 'verein', '11', 'rt0000000000000a', NULL)`,
     "CREATE TABLE redirects (from_id VARCHAR, to_id VARCHAR, reason VARCHAR)",
-    "INSERT INTO redirects VALUES ('rpdeadbeef000000', 'rp1b829f1d3468c4', 'merge')",
+    `INSERT INTO redirects VALUES
+      ('rpdeadbeef000000', 'rp1b829f1d3468c4', 'merged'),
+      ('rpwithdrawn00000', '', 'de_corroborated'),
+      ('rpwithheld000000', NULL, 'withheld'),
+      ('rpmergedgone0000', 'rpwithdrawn00000', 'merged')`,
     "CREATE TABLE entity_search (reep_id VARCHAR, entity_type VARCHAR, label VARCHAR, search_text VARCHAR, bridge_count BIGINT)",
     "INSERT INTO entity_search VALUES ('rp1b829f1d3468c4', 'player', 'Declan Rice', 'declan rice rice', 3), ('rt0000000000000a', 'team', 'Some Club', 'some club', 1), ('rp0000000000000b', 'player', '100% Striker', '100% striker', 0)",
   ]) {
@@ -85,6 +89,23 @@ describe("resolve_entity against a local register", () => {
     expect(t).toContain("Matched: wyscout / player: 379209");
     expect(t).toContain("skillcorner / player: 12174");
     expect(t).toContain(`Local register release: ${STAMP} (current).`);
+    expect(t).not.toContain("No namespace was given");
+  });
+
+  it("says when an ID without a namespace matched in only one namespace", async () => {
+    const r = await resolveEntity({ provider: "wyscout", id: "379209" }, { env: LOCAL, openLocal, fetchImpl: latest(STAMP) });
+    const t = text(r);
+    expect(t).toContain("Declan Rice");
+    expect(t).toContain('**No namespace was given.** It matched only in namespace "player".');
+  });
+
+  it("does not add the single-namespace note when the type pins the entity", async () => {
+    const r = await resolveEntity(
+      { provider: "wyscout", id: "379209", type: "player" },
+      { env: LOCAL, openLocal, fetchImpl: latest(STAMP) },
+    );
+    expect(text(r)).toContain("Declan Rice");
+    expect(text(r)).not.toContain("No namespace was given");
   });
 
   it("warns when an ID without a namespace matches in several namespaces", async () => {
@@ -107,6 +128,38 @@ describe("resolve_entity against a local register", () => {
   it("follows a merge redirect to the survivor", async () => {
     const r = await resolveEntity({ reep_id: "rpdeadbeef000000" }, { env: LOCAL, openLocal, fetchImpl: latest(STAMP) });
     expect(text(r)).toContain("Redirected: rpdeadbeef000000 was merged into rp1b829f1d3468c4");
+  });
+
+  it("reports a withdrawn ID as withdrawn, not as unknown", async () => {
+    const r = await resolveEntity({ reep_id: "rpwithdrawn00000" }, { env: LOCAL, openLocal, fetchImpl: latest(STAMP) });
+    const t = text(r);
+    expect(r.isError).toBeUndefined();
+    expect(t).toContain("Reep ID rpwithdrawn00000 is withdrawn (reason: de_corroborated)");
+    expect(t).toContain("no survivor ID");
+    expect(t).not.toContain("No Reep entity matches");
+  });
+
+  it("reports a withheld ID, whose to_id is NULL", async () => {
+    const r = await resolveEntity({ reep_id: "rpwithheld000000" }, { env: LOCAL, openLocal, fetchImpl: latest(STAMP) });
+    expect(text(r)).toContain("Reep ID rpwithheld000000 is withheld (reason: withheld)");
+  });
+
+  it("reports a merge whose survivor was later withdrawn", async () => {
+    const r = await resolveEntity({ reep_id: "rpmergedgone0000" }, { env: LOCAL, openLocal, fetchImpl: latest(STAMP) });
+    expect(text(r)).toContain("rpmergedgone0000 was merged into rpwithdrawn00000, and Reep ID rpwithdrawn00000 is withdrawn");
+  });
+
+  it("suggests SQL that reports tombstones and runs against the register's schema", async () => {
+    const t = text(await resolveEntity({ reep_id: "rpwithdrawn00000" }, { env: {}, fetchImpl: noNetwork }));
+    const sql = t.split("```sql\n")[1].split("\n```")[0];
+    const statements = sql.split(";").map((s) => s.replace(/^\s*--.*$/gm, "").trim()).filter(Boolean);
+    expect(statements).toHaveLength(2);
+    const tombstone = await register.query(statements[0], {});
+    expect(tombstone).toEqual([{ from_id: "rpwithdrawn00000", to_id: "", reason: "de_corroborated" }]);
+    expect(await register.query(statements[1], {})).toEqual([]);
+    const merged = text(await resolveEntity({ reep_id: "rpdeadbeef000000" }, { env: {}, fetchImpl: noNetwork }));
+    const survivorSql = merged.split("```sql\n")[1].split("\n```")[0].split(";")[1];
+    expect((await register.query(survivorSql, {})).length).toBe(3);
   });
 
   it("treats % in a name as a literal character", async () => {
@@ -194,6 +247,28 @@ describe("resolve_entity against the API", () => {
     expect(t).toContain("wyscout / player: 379209\n");
     expect(t).toContain(`Release: ${STAMP} · Lookups remaining this month: 999`);
     expect(t).not.toContain("secret-key");
+  });
+
+  it("names the namespace a provider ID matched in when none was given", async () => {
+    const fetchImpl = async () =>
+      reply(200, {
+        results: [
+          {
+            reep_id: "rp1b829f1d3468c4",
+            entity_type: "player",
+            name_en: "Declan Rice",
+            bridges: [{ provider: "wyscout", namespace: "player", external_id: "379209" }],
+          },
+        ],
+      });
+    const r = await resolveEntity({ provider: "wyscout", id: "379209" }, { env: KEYED, fetchImpl });
+    expect(text(r)).toContain('**No namespace was given.** It matched only in namespace "player".');
+  });
+
+  it("keeps the API's reason when an entity is not found", async () => {
+    const fetchImpl = async () => reply(404, { error: "entity_removed", message: "withdrawn in release 20261005T180536Z" });
+    const r = await resolveEntity({ reep_id: "rpwithdrawn00000" }, { env: KEYED, fetchImpl });
+    expect(text(r)).toContain("No Reep entity matches that query (entity_removed: withdrawn in release 20261005T180536Z).");
   });
 
   it("lists candidates for an ambiguous provider ID (409)", async () => {
