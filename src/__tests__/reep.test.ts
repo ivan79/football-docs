@@ -62,25 +62,42 @@ function summaryViolations(text: string): string[] {
   return errors;
 }
 
+/** The columns of a known table, or of a CTE defined in the same block. */
+function columnsOf(table: string, ctes: Record<string, Set<string>>): Set<string> {
+  return ctes[table] ?? columns[table] ?? new Set(EXTRA_TABLES[table]);
+}
+
 /**
  * Inside ```sql blocks: every table after FROM/JOIN must exist, and every
- * alias.column must be a column of the table that alias names.
+ * alias.column must be a column of the table that alias names. A CTE
+ * (`WITH rb AS (SELECT b.*, … AS survivor_id FROM bridges b …)`) counts as a
+ * table whose columns are its base table's (for `alias.*`) plus its `AS` names.
  */
 function sqlViolations(text: string): string[] {
   const errors: string[] = [];
   for (const block of text.matchAll(/```sql\n([\s\S]*?)```/g)) {
     const sql = block[1].replace(/--.*$/gm, "");
+    const ctes: Record<string, Set<string>> = {};
+    for (const m of sql.matchAll(
+      /\b(?:WITH|,)\s*([a-z_]+)\s+AS\s*\(\s*SELECT\s+([\s\S]*?)\bFROM\s+([a-z_]+)(?:\s+(?:AS\s+)?([a-z]{1,2})\b)?/g,
+    )) {
+      const [, name, select, table, alias] = m;
+      const cols = new Set<string>();
+      if (alias && new RegExp(`\\b${alias}\\.\\*`).test(select)) for (const c of columnsOf(table, ctes)) cols.add(c);
+      for (const a of select.matchAll(/\bAS\s+([a-z_]+)/g)) cols.add(a[1]);
+      ctes[name] = cols;
+    }
     const aliases: Record<string, string> = {};
     for (const m of sql.matchAll(/\b(?:FROM|JOIN)\s+([a-z_]+)\b(?!\s*\()(?:\s+(?:AS\s+)?([a-z]{1,2})\b)?/g)) {
       const [, table, alias] = m;
-      if (!knownTables.has(table)) errors.push(`unknown table ${table}`);
+      if (!knownTables.has(table) && !ctes[table]) errors.push(`unknown table ${table}`);
       else if (alias) aliases[alias] = table;
     }
     for (const m of sql.matchAll(/\b([a-z]{1,2})\.([a-z_]+)\b/g)) {
       const [, alias, col] = m;
       const table = aliases[alias];
       if (!table) errors.push(`alias ${alias} names no table`);
-      else if (!(columns[table] ?? new Set(EXTRA_TABLES[table])).has(col)) {
+      else if (!columnsOf(table, ctes).has(col)) {
         errors.push(`${table}.${col} not in schema`);
       }
     }
@@ -137,6 +154,10 @@ describe("Reep docs match the release snapshot", () => {
       "alias z names no table",
     ]);
     expect(sqlViolations("```sql\nSELECT * FROM transfers;\n```")).toEqual(["unknown table transfers"]);
+    // A CTE is a table with its base table's columns plus its own AS names.
+    expect(
+      sqlViolations("```sql\nWITH rb AS (SELECT b.*, b.reep_id AS survivor_id FROM bridges b)\nSELECT a.survivor_id, a.provider, a.nonesuch FROM rb a;\n```"),
+    ).toEqual(["rb.nonesuch not in schema"]);
     expect(documentedCsvTables("Tables available as CSV: `bridges`, `transfers`.")).toEqual([
       "bridges",
       "transfers",

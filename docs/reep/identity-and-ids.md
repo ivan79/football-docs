@@ -94,6 +94,10 @@ FROM my_saved_ids x
 LEFT JOIN redirects r ON r.from_id = x.reep_id;
 ```
 
+The same applies to the `reep_id` on a bridge row: a merged ID keeps its
+bridges, so resolve it through `redirects` before joining. See "Bridges can name
+a merged Reep ID" on the download page.
+
 In the API, requesting a redirected ID returns HTTP 200 with the survivor, and
 the body carries `requested_id` and `redirected_to` so the stored ID can be
 updated. Source: [get-started guide](https://reep.football/get-started).
