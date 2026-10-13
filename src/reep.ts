@@ -131,9 +131,32 @@ async function localRegister(path: string, options: ResolveEntityOptions): Promi
  * table holds these as rows with an empty to_id, next to the merges (which carry
  * the survivor): reason de_corroborated (withdrawn) or withheld.
  */
-type Tombstone = { id: string; reason: string; requested_id?: string };
+type Tombstone = { id: string; reason: string; requested_id?: string; matched?: string };
 
-async function localLookup(register: LocalRegister, q: Query): Promise<{ found: Found[]; tombstone?: Tombstone }> {
+/**
+ * Follow merge redirects to the survivor (bounded, in case of a chain). A row
+ * with an empty to_id is a tombstone, not a merge: stop there. Bridges can name
+ * a merged ID too, so every hit goes through this, not only Reep ID lookups.
+ */
+async function followRedirects(register: LocalRegister, start: string): Promise<{ id: string; tombstone?: Tombstone }> {
+  let current = start;
+  for (let hop = 0; hop < 5; hop++) {
+    const next = await register.query("SELECT to_id, reason FROM redirects WHERE from_id = $id", { id: current });
+    if (!next.length) break;
+    const to = next[0].to_id == null ? "" : String(next[0].to_id).trim();
+    if (!to) {
+      const reason = next[0].reason == null ? "" : String(next[0].reason).trim();
+      return { id: current, tombstone: { id: current, reason, requested_id: current === start ? undefined : start } };
+    }
+    current = to;
+  }
+  return { id: current };
+}
+
+async function localLookup(
+  register: LocalRegister,
+  q: Query,
+): Promise<{ found: Found[]; tombstone?: Tombstone; tombstones: Tombstone[] }> {
   let ids: Array<{
     reep_id: string;
     requested_id?: string;
@@ -161,20 +184,7 @@ async function localLookup(register: LocalRegister, q: Query): Promise<{ found: 
       matched_namespace: String(r.namespace ?? ""),
     }));
   } else if (q.kind === "reep_id") {
-    // Follow merge redirects to the survivor (bounded, in case of a chain). A row
-    // with an empty to_id is a tombstone, not a merge: stop and report it.
-    let current = q.reepId;
-    for (let hop = 0; hop < 5; hop++) {
-      const next = await register.query("SELECT to_id, reason FROM redirects WHERE from_id = $id", { id: current });
-      if (!next.length) break;
-      const to = next[0].to_id == null ? "" : String(next[0].to_id).trim();
-      if (!to) {
-        const reason = next[0].reason == null ? "" : String(next[0].reason).trim();
-        return { found: [], tombstone: { id: current, reason, requested_id: current === q.reepId ? undefined : q.reepId } };
-      }
-      current = to;
-    }
-    ids = [{ reep_id: current, requested_id: current === q.reepId ? undefined : q.reepId }];
+    ids = [{ reep_id: q.reepId }];
   } else {
     const pattern = `%${q.name.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
     const params: Record<string, string> = { pattern };
@@ -190,20 +200,30 @@ async function localLookup(register: LocalRegister, q: Query): Promise<{ found: 
   }
 
   const found: Found[] = [];
+  const tombstones: Tombstone[] = [];
+  const seen = new Set<string>();
   for (const hit of ids) {
+    const target = await followRedirects(register, hit.reep_id);
+    if (target.tombstone) {
+      tombstones.push({ ...target.tombstone, matched: hit.matched });
+      continue;
+    }
+    // Two bridges (or search hits) can lead to the same survivor.
+    if (seen.has(target.id)) continue;
+    seen.add(target.id);
     const entity = await register.query("SELECT reep_id, label, entity_type FROM entities WHERE reep_id = $id", {
-      id: hit.reep_id,
+      id: target.id,
     });
     if (!entity.length) continue;
     const bridges = await register.query(
       "SELECT provider, namespace, external_id FROM bridges WHERE reep_id = $id ORDER BY provider, namespace, external_id",
-      { id: hit.reep_id },
+      { id: target.id },
     );
     found.push({
-      reep_id: hit.reep_id,
+      reep_id: target.id,
       label: String(entity[0].label),
       entity_type: String(entity[0].entity_type),
-      requested_id: hit.requested_id,
+      requested_id: target.id === hit.reep_id ? undefined : hit.reep_id,
       matched: hit.matched,
       matched_namespace: hit.matched_namespace,
       bridges: bridges.map((b) => ({
@@ -213,11 +233,13 @@ async function localLookup(register: LocalRegister, q: Query): Promise<{ found: 
       })),
     });
   }
-  return { found };
+  if (q.kind === "reep_id" && tombstones.length) return { found: [], tombstone: tombstones[0], tombstones };
+  return { found, tombstones };
 }
 
 /** What a tombstone means, from the redirects table's published schema note. */
 function tombstoneText(t: Tombstone): string {
+  const matched = t.matched ? `${t.matched} points at ${t.requested_id ?? t.id}. ` : "";
   const via = t.requested_id ? `${t.requested_id} was merged into ${t.id}, and ` : "";
   const what =
     t.reason === "de_corroborated"
@@ -228,8 +250,8 @@ function tombstoneText(t: Tombstone): string {
           "teams or the season horizon) keeps out of this release."
         : `has a tombstone in the redirects table (reason: ${t.reason || "none given"}) with no survivor.`;
   return (
-    `${via}Reep ID ${t.id} ${what} It is not a merge, so there is no survivor ID, and the release lists no provider ` +
-    "IDs for it. Do not treat it as an unknown ID: it was published, and the ID will never be reused."
+    `${matched}${via}Reep ID ${t.id} ${what} It is not a merge, so there is no survivor ID. Do not treat it as an unknown ID: ` +
+    "it was published, and the ID will never be reused."
   );
 }
 
@@ -421,9 +443,13 @@ function sqlFor(q: Query): string {
   const quote = (s: string) => `'${s.replace(/'/g, "''")}'`;
   if (q.kind === "provider") {
     return [
-      "SELECT e.reep_id, e.label, e.entity_type, o.provider, o.namespace, o.external_id",
+      "-- A bridge can name a merged Reep ID: follow its redirect to the survivor. An empty",
+      "-- to_id is a tombstone (redirect_reason de_corroborated or withheld), not a merge.",
+      "SELECT b.reep_id AS bridged_id, r.reason AS redirect_reason, e.reep_id, e.label, e.entity_type,",
+      "       o.provider, o.namespace, o.external_id",
       "FROM bridges b",
-      "JOIN entities e USING (reep_id)",
+      "LEFT JOIN redirects r ON r.from_id = b.reep_id",
+      "JOIN entities e ON e.reep_id = coalesce(nullif(r.to_id, ''), b.reep_id)",
       "JOIN bridges o ON o.reep_id = e.reep_id",
       `WHERE b.provider = ${quote(q.provider)}${q.namespace ? ` AND b.namespace = ${quote(q.namespace)}` : ""}`,
       `  AND b.external_id = ${quote(q.id)}`,
@@ -440,6 +466,7 @@ function sqlFor(q: Query): string {
       "SELECT e.reep_id, e.label, e.entity_type, b.provider, b.namespace, b.external_id",
       "FROM entities e JOIN bridges b USING (reep_id)",
       `WHERE e.reep_id = coalesce((SELECT nullif(to_id, '') FROM redirects WHERE from_id = ${quote(q.reepId)}), ${quote(q.reepId)})`,
+      `  AND NOT EXISTS (SELECT 1 FROM redirects WHERE from_id = ${quote(q.reepId)} AND coalesce(to_id, '') = '')`,
       "ORDER BY b.provider, b.namespace;",
     ].join("\n");
   }
@@ -509,12 +536,16 @@ export async function resolveEntity(args: ResolveEntityArgs, options: ResolveEnt
   if (path) {
     try {
       const register = await localRegister(path, options);
-      const { found, tombstone } = await localLookup(register, q);
+      const { found, tombstone, tombstones } = await localLookup(register, q);
       const note = await freshnessNote(path, register.stamp, fetchImpl);
       if (tombstone) return textResult(`${tombstoneText(tombstone)}\n\n${note}`);
-      if (!found.length) return textResult(`No Reep entity matches that query in the local register.\n\n${note}`);
+      const gone = tombstones.map((t) => tombstoneText(t)).join("\n\n");
+      if (!found.length) {
+        return textResult(`${gone || "No Reep entity matches that query in the local register."}\n\n${note}`);
+      }
       return textResult(
-        `Found ${found.length} result(s) in the local Reep register:\n\n${formatFound(found)}${namespaceNote(q, found)}\n\n${note}`,
+        `Found ${found.length} result(s) in the local Reep register:\n\n${formatFound(found)}${namespaceNote(q, found)}` +
+          `${gone ? `\n\n${gone}` : ""}\n\n${note}`,
       );
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
