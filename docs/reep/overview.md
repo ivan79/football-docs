@@ -64,6 +64,10 @@ What the answers say:
 - A withdrawn or withheld Reep ID (a tombstone in `redirects`, with an empty
   `to_id`) is reported as withdrawn or withheld, with the reason. It is not
   reported as unknown: it was published, and the ID is never reused.
+- Provider IDs that the provider no longer uses (`upstream_status` retired or
+  removed, in a local register file) are marked, and listed after the live
+  ones. They still resolve, so an old stored ID keeps working, but map to the
+  unmarked ones. The Reep API does not return this field.
 - A provider ID looked up without a namespace gets a note: which namespace it
   matched in, or a warning when it matched in more than one. Pass the
   namespace (or the entity type) to be sure of the entity.
