@@ -14,19 +14,26 @@ beforeAll(async () => {
     "CREATE TABLE release_metadata (key VARCHAR, value VARCHAR)",
     `INSERT INTO release_metadata VALUES ('source_stamp', '${STAMP}')`,
     "CREATE TABLE entities (reep_id VARCHAR, entity_type VARCHAR, status VARCHAR, label VARCHAR)",
-    "INSERT INTO entities VALUES ('rp1b829f1d3468c4', 'player', 'active', 'Declan Rice'), ('rt0000000000000a', 'team', 'active', 'Some Club'), ('rp0000000000000b', 'player', 'active', '100% Striker')",
+    `INSERT INTO entities VALUES ('rp1b829f1d3468c4', 'player', 'active', 'Declan Rice'), ('rt0000000000000a', 'team', 'active', 'Some Club'),
+      ('rp0000000000000b', 'player', 'active', '100% Striker'),
+      ('rpmergedsrc00001', 'player', 'redirected', 'Samuel Maslej'), ('rpsurvivor000001', 'player', 'active', 'Samuel Mašlej'),
+      ('rpwithdrawn00000', 'player', 'withdrawn', 'Gone Player')`,
     "CREATE TABLE bridges (provider VARCHAR, namespace VARCHAR, external_id VARCHAR, reep_id VARCHAR, rung VARCHAR)",
     `INSERT INTO bridges VALUES
       ('wyscout', 'player', '379209', 'rp1b829f1d3468c4', NULL),
       ('skillcorner', 'player', '12174', 'rp1b829f1d3468c4', NULL),
       ('transfermarkt', 'spieler', '11', 'rp1b829f1d3468c4', NULL),
-      ('transfermarkt', 'verein', '11', 'rt0000000000000a', NULL)`,
+      ('transfermarkt', 'verein', '11', 'rt0000000000000a', NULL),
+      ('transfermarkt', 'spieler', '1146905', 'rpmergedsrc00001', NULL),
+      ('wyscout', 'player', '555', 'rpsurvivor000001', NULL),
+      ('opta', 'player', '777', 'rpwithdrawn00000', NULL)`,
     "CREATE TABLE redirects (from_id VARCHAR, to_id VARCHAR, reason VARCHAR)",
     `INSERT INTO redirects VALUES
       ('rpdeadbeef000000', 'rp1b829f1d3468c4', 'merged'),
       ('rpwithdrawn00000', '', 'de_corroborated'),
       ('rpwithheld000000', NULL, 'withheld'),
-      ('rpmergedgone0000', 'rpwithdrawn00000', 'merged')`,
+      ('rpmergedgone0000', 'rpwithdrawn00000', 'merged'),
+      ('rpmergedsrc00001', 'rpsurvivor000001', 'merged')`,
     "CREATE TABLE entity_search (reep_id VARCHAR, entity_type VARCHAR, label VARCHAR, search_text VARCHAR, bridge_count BIGINT)",
     "INSERT INTO entity_search VALUES ('rp1b829f1d3468c4', 'player', 'Declan Rice', 'declan rice rice', 3), ('rt0000000000000a', 'team', 'Some Club', 'some club', 1), ('rp0000000000000b', 'player', '100% Striker', '100% striker', 0)",
   ]) {
@@ -128,6 +135,39 @@ describe("resolve_entity against a local register", () => {
   it("follows a merge redirect to the survivor", async () => {
     const r = await resolveEntity({ reep_id: "rpdeadbeef000000" }, { env: LOCAL, openLocal, fetchImpl: latest(STAMP) });
     expect(text(r)).toContain("Redirected: rpdeadbeef000000 was merged into rp1b829f1d3468c4");
+  });
+
+  it("follows a bridge that names a merged Reep ID to the survivor", async () => {
+    const r = await resolveEntity(
+      { provider: "transfermarkt", namespace: "spieler", id: "1146905" },
+      { env: LOCAL, openLocal, fetchImpl: latest(STAMP) },
+    );
+    const t = text(r);
+    expect(t).toContain("### Samuel Mašlej (player)");
+    expect(t).toContain("Reep ID: rpsurvivor000001");
+    expect(t).toContain("Redirected: rpmergedsrc00001 was merged into rpsurvivor000001");
+    expect(t).toContain("wyscout / player: 555");
+    expect(t).not.toContain("Samuel Maslej (player)");
+  });
+
+  it("reports a bridge that names a withdrawn Reep ID", async () => {
+    const r = await resolveEntity(
+      { provider: "opta", namespace: "player", id: "777" },
+      { env: LOCAL, openLocal, fetchImpl: latest(STAMP) },
+    );
+    const t = text(r);
+    expect(t).toContain("opta / player: 777 points at rpwithdrawn00000.");
+    expect(t).toContain("Reep ID rpwithdrawn00000 is withdrawn (reason: de_corroborated)");
+    expect(t).not.toContain("Gone Player");
+  });
+
+  it("suggests provider SQL that follows a bridge's redirect", async () => {
+    const t = text(await resolveEntity({ provider: "transfermarkt", namespace: "spieler", id: "1146905" }, { env: {}, fetchImpl: noNetwork }));
+    const sql = t.split("```sql\n")[1].split("\n```")[0];
+    const rows = await register.query(sql, {});
+    expect(rows.length).toBeGreaterThan(0);
+    expect(new Set(rows.map((row) => row.reep_id))).toEqual(new Set(["rpsurvivor000001"]));
+    expect(rows[0].bridged_id).toBe("rpmergedsrc00001");
   });
 
   it("reports a withdrawn ID as withdrawn, not as unknown", async () => {
