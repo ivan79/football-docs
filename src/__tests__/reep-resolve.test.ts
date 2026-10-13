@@ -26,6 +26,7 @@ beforeAll(async () => {
       ('transfermarkt', 'verein', '11', 'rt0000000000000a', NULL),
       ('transfermarkt', 'spieler', '1146905', 'rpmergedsrc00001', NULL),
       ('wyscout', 'player', '555', 'rpsurvivor000001', NULL),
+      ('wyscout', 'player', '555', 'rpmergedsrc00001', NULL),
       ('opta', 'player', '777', 'rpwithdrawn00000', NULL)`,
     "CREATE TABLE redirects (from_id VARCHAR, to_id VARCHAR, reason VARCHAR)",
     `INSERT INTO redirects VALUES
@@ -150,6 +151,14 @@ describe("resolve_entity against a local register", () => {
     expect(t).not.toContain("Samuel Maslej (player)");
   });
 
+  it("lists a provider ID still attached to a merged ID under the survivor, once", async () => {
+    const r = await resolveEntity({ reep_id: "rpsurvivor000001" }, { env: LOCAL, openLocal, fetchImpl: latest(STAMP) });
+    const t = text(r);
+    expect(t).toContain("transfermarkt / spieler: 1146905 (via merged rpmergedsrc00001)");
+    expect(t).toContain("wyscout / player: 555\n");
+    expect(t.match(/wyscout \/ player: 555/g)).toHaveLength(1);
+  });
+
   it("reports a bridge that names a withdrawn Reep ID", async () => {
     const r = await resolveEntity(
       { provider: "opta", namespace: "player", id: "777" },
@@ -168,6 +177,7 @@ describe("resolve_entity against a local register", () => {
     expect(rows.length).toBeGreaterThan(0);
     expect(new Set(rows.map((row) => row.reep_id))).toEqual(new Set(["rpsurvivor000001"]));
     expect(rows[0].bridged_id).toBe("rpmergedsrc00001");
+    expect(rows.some((row) => row.provider === "transfermarkt" && row.external_id === "1146905")).toBe(true);
   });
 
   it("reports a withdrawn ID as withdrawn, not as unknown", async () => {

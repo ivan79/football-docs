@@ -56,7 +56,14 @@ export type ResolveEntityOptions = {
   openLocal?: (path: string) => Promise<LocalRegister>;
 };
 
-type Bridge = { provider: string; namespace: string; external_id: string; role?: string };
+type Bridge = {
+  provider: string;
+  namespace: string;
+  external_id: string;
+  role?: string;
+  /** The merged Reep ID this bridge is still attached to in the release, when it is not the entity's own. */
+  via?: string;
+};
 type Found = {
   reep_id: string;
   label: string;
@@ -215,10 +222,23 @@ async function localLookup(
       id: target.id,
     });
     if (!entity.length) continue;
+    // A release can leave a provider ID on a merged Reep ID, not on its survivor,
+    // so the survivor's own bridges are incomplete. Add the bridges of every ID
+    // merged into it (through chains, bounded), marked with the merged ID.
     const bridges = await register.query(
-      "SELECT provider, namespace, external_id FROM bridges WHERE reep_id = $id ORDER BY provider, namespace, external_id",
+      [
+        "WITH RECURSIVE merged(id, depth) AS (",
+        "  SELECT from_id, 1 FROM redirects WHERE to_id = $id",
+        "  UNION ALL",
+        "  SELECT r.from_id, m.depth + 1 FROM redirects r JOIN merged m ON r.to_id = m.id WHERE m.depth < 5",
+        ")",
+        "SELECT provider, namespace, external_id, CASE WHEN reep_id = $id THEN NULL ELSE reep_id END AS via",
+        "FROM bridges WHERE reep_id = $id OR reep_id IN (SELECT id FROM merged)",
+        "ORDER BY provider, namespace, external_id, via NULLS FIRST",
+      ].join("\n"),
       { id: target.id },
     );
+    const own = new Set<string>();
     found.push({
       reep_id: target.id,
       label: String(entity[0].label),
@@ -226,11 +246,20 @@ async function localLookup(
       requested_id: target.id === hit.reep_id ? undefined : hit.reep_id,
       matched: hit.matched,
       matched_namespace: hit.matched_namespace,
-      bridges: bridges.map((b) => ({
-        provider: String(b.provider),
-        namespace: String(b.namespace ?? ""),
-        external_id: String(b.external_id),
-      })),
+      bridges: bridges
+        .map((b) => ({
+          provider: String(b.provider),
+          namespace: String(b.namespace ?? ""),
+          external_id: String(b.external_id),
+          via: b.via == null ? undefined : String(b.via),
+        }))
+        .filter((b) => {
+          // The survivor's own bridge wins over the same provider ID on a merged ID.
+          const key = `${b.provider}\u0000${b.namespace}\u0000${b.external_id}`;
+          if (own.has(key)) return false;
+          own.add(key);
+          return true;
+        }),
     });
   }
   if (q.kind === "reep_id" && tombstones.length) return { found: [], tombstone: tombstones[0], tombstones };
@@ -450,7 +479,8 @@ function sqlFor(q: Query): string {
       "FROM bridges b",
       "LEFT JOIN redirects r ON r.from_id = b.reep_id",
       "JOIN entities e ON e.reep_id = coalesce(nullif(r.to_id, ''), b.reep_id)",
-      "JOIN bridges o ON o.reep_id = e.reep_id",
+      "-- The survivor's provider IDs, plus any still attached to an ID merged into it.",
+      "JOIN bridges o ON o.reep_id = e.reep_id OR o.reep_id IN (SELECT from_id FROM redirects WHERE to_id = e.reep_id)",
       `WHERE b.provider = ${quote(q.provider)}${q.namespace ? ` AND b.namespace = ${quote(q.namespace)}` : ""}`,
       `  AND b.external_id = ${quote(q.id)}`,
       "ORDER BY o.provider, o.namespace;",
@@ -462,9 +492,11 @@ function sqlFor(q: Query): string {
       "-- (reason de_corroborated) or withheld, not merged.",
       `SELECT from_id, to_id, reason FROM redirects WHERE from_id = ${quote(q.reepId)};`,
       "",
-      "-- Then follow a merge redirect to the survivor, and list every provider ID.",
-      "SELECT e.reep_id, e.label, e.entity_type, b.provider, b.namespace, b.external_id",
-      "FROM entities e JOIN bridges b USING (reep_id)",
+      "-- Then follow a merge redirect to the survivor, and list every provider ID, including",
+      "-- any still attached to an ID merged into it (bridged_on names that ID).",
+      "SELECT e.reep_id, e.label, e.entity_type, b.provider, b.namespace, b.external_id, b.reep_id AS bridged_on",
+      "FROM entities e",
+      "JOIN bridges b ON b.reep_id = e.reep_id OR b.reep_id IN (SELECT from_id FROM redirects WHERE to_id = e.reep_id)",
       `WHERE e.reep_id = coalesce((SELECT nullif(to_id, '') FROM redirects WHERE from_id = ${quote(q.reepId)}), ${quote(q.reepId)})`,
       `  AND NOT EXISTS (SELECT 1 FROM redirects WHERE from_id = ${quote(q.reepId)} AND coalesce(to_id, '') = '')`,
       "ORDER BY b.provider, b.namespace;",
@@ -513,7 +545,8 @@ function formatFound(found: Found[]): string {
         if (!f.bridges.length) lines.push("  (none)");
         for (const b of f.bridges) {
           const role = b.role && b.role !== "canonical_bridge" ? ` (${b.role})` : "";
-          lines.push(`  ${b.provider}${b.namespace ? ` / ${b.namespace}` : ""}: ${b.external_id}${role}`);
+          const via = b.via ? ` (via merged ${b.via})` : "";
+          lines.push(`  ${b.provider}${b.namespace ? ` / ${b.namespace}` : ""}: ${b.external_id}${role}${via}`);
         }
       } else if (f.bridge_count !== undefined) {
         lines.push(`Providers bridged: ${f.bridge_count}`);

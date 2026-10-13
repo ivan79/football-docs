@@ -58,7 +58,9 @@ that answers the question from the download.
 What the answers say:
 
 - A merged Reep ID is followed to its survivor, and the answer names both IDs.
-  This includes a provider ID whose bridge still names the merged ID.
+  This includes a provider ID whose bridge still names the merged ID. The
+  survivor's provider IDs include any still attached to an ID merged into it,
+  marked "(via merged <id>)".
 - A withdrawn or withheld Reep ID (a tombstone in `redirects`, with an empty
   `to_id`) is reported as withdrawn or withheld, with the reason. It is not
   reported as unknown: it was published, and the ID is never reused.
